@@ -1,0 +1,51 @@
+# 주식 스크리닝 설정 파일
+# 모든 기준값은 여기서 바꿀 수 있습니다. (규칙 번호는 README의 10단계 규칙과 같습니다)
+
+[data]
+# OpenDART API 키는 환경변수 DART_API_KEY 로 넣는 것을 권장합니다. (여기에 직접 써도 동작)
+dart_api_key = ""
+cache_dir = "cache"
+output_dir = "output"
+years = 10                 # 기본 확보 연수
+reprt_code = "11011"       # 사업보고서(연간)
+
+[universe]
+exclude_financials = true  # 은행·보험·증권·지주 등 금융업 제외 (부채비율·영업이익 구조가 달라 규칙 적용이 왜곡됨)
+exclude_preferred = true   # 우선주 제외
+exclude_spac = true        # 스팩 제외
+markets = ["KOSPI", "KOSDAQ"]
+
+[rule1_data]               # 1. 재무자료 검증
+min_years = 7
+max_operating_losses = 0
+min_owner_earnings_positive_ratio = 0.80
+
+[rule2_quality]            # 2. 수익성·재무건전성 (3개 중 min_pass 개 이상)
+min_pass = 2
+roe_threshold = 0.10
+roe_year_ratio = 0.80
+max_debt_ratio = 1.00      # 부채/자본 100% 미만
+min_avg_op_margin = 0.07
+
+[rule3_redflags]           # 3. 재무제표 주의 신호
+check_audit_opinion = true
+min_cfo_to_ni_3y = 0.50          # 최근 3년 누적 영업현금흐름 / 누적 지배순이익 이 값 미만이면 경고
+max_receivable_gap = 0.30        # 매출채권 증가율 - 매출 증가율 (최근 1년) 이 값 초과면 경고
+max_inventory_gap = 0.30         # 재고자산 증가율 - 매출 증가율 (최근 1년) 이 값 초과면 경고
+max_share_dilution_3y = 0.10     # 최근 3년 유통주식수 증가율 (유상증자·CB 전환 등)
+max_one_off_ratio = 0.50         # 최근연도 (지배순이익 - 세후영업이익)/지배순이익 이 값 초과면 일회성 이익 경고
+
+[rule4_liquidity]          # 4. 거래 유동성
+min_avg_trading_value = 500_000_000   # 일평균 거래대금 5억 원
+lookback_days = 20
+
+[rule5_valuation]          # 5·7. 가치평가 및 적정주가
+normal_years = 5                 # 정상이익·정상 오너어닝 산출 기간(최근 N년 평균)
+tax_rate = 0.22                  # 세후영업이익 계산용 법인세율
+conservative_yield = 0.10        # 보수적 적정가 = 이익 / 10%  (PER 10배)
+normal_yield = 0.07              # 일반 적정가   = 이익 / 7%   (PER 약 14.3배)
+generous_yield = 0.04            # 후한 적정가   = 이익 / 4%   (PER 25배)  ← 사용자 지정
+undervalued_tier = "normal"      # "저평가" 판정 기준가 (conservative | normal)
+
+[rule6_trend]              # 6. 영업이익 추세
+lookback = 3

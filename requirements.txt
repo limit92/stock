@@ -1,0 +1,4 @@
+finance-datareader>=0.9.90
+requests
+pandas
+openpyxl
