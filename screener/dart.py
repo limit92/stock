@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -22,7 +24,7 @@ class DartError(RuntimeError):
 
 
 class Dart:
-    def __init__(self, api_key: str, cache_dir: str | Path, pause: float = 0.12):
+    def __init__(self, api_key: str, cache_dir: str | Path, pause: float = 0.12, workers: int = 1):
         if not api_key:
             raise DartError("OpenDART API 키가 없습니다. 환경변수 DART_API_KEY 를 설정하세요.")
         self.key = api_key
@@ -30,6 +32,8 @@ class Dart:
         self.cache.mkdir(parents=True, exist_ok=True)
         self.pause = pause
         self.calls = 0
+        self.workers = max(1, workers)
+        self._lock = threading.Lock()
 
     # ---------- low level ----------
     def _get(self, endpoint: str, **params):
@@ -37,7 +41,8 @@ class Dart:
         for attempt in range(4):
             try:
                 r = requests.get(f"{BASE}/{endpoint}", params=params, timeout=30)
-                self.calls += 1
+                with self._lock:
+                    self.calls += 1
                 time.sleep(self.pause)
                 r.raise_for_status()
                 return r
@@ -84,15 +89,15 @@ class Dart:
     # ---------- financial statements ----------
     def multi_accounts(self, corp_codes: list[str], year: int, reprt_code: str = "11011") -> list[dict]:
         """다중회사 주요계정 (최대 100개사/호출). 1차 거르기용."""
-        rows = []
-        for i in range(0, len(corp_codes), 100):
-            chunk = corp_codes[i : i + 100]
+        def one(chunk):
             tag = f"{chunk[0]}_{chunk[-1]}_{len(chunk)}"
             f = self.cache / "_multi" / f"{year}_{reprt_code}_{tag}.json"
-            d = self._json("fnlttMultiAcnt.json", f, corp_code=",".join(chunk),
-                           bsns_year=str(year), reprt_code=reprt_code)
-            rows.extend(d.get("list", []))
-        return rows
+            return self._json("fnlttMultiAcnt.json", f, corp_code=",".join(chunk),
+                              bsns_year=str(year), reprt_code=reprt_code).get("list", [])
+
+        chunks = [corp_codes[i : i + 100] for i in range(0, len(corp_codes), 100)]
+        with ThreadPoolExecutor(self.workers) as ex:
+            return [row for part in ex.map(one, chunks) for row in part]
 
     def full_statements(self, corp_code: str, year: int, reprt_code: str = "11011") -> tuple[str, list[dict]]:
         """단일회사 전체 재무제표. 연결(CFS) 우선, 없으면 별도(OFS). (fs_div, rows) 반환."""

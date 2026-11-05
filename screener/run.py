@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -46,7 +47,9 @@ def screen_one(dart: Dart, cfg: dict, code: str, name: str, cc: str, years: list
                price: float, listed_shares: float, induty: str | None) -> rules.Result:
     rc = cfg["data"]["reprt_code"]
     r = rules.Result(code=code, name=name)
-    by_year = {y: dart.full_statements(cc, y, rc)[1] for y in years}
+    # 연도별 호출은 서로 독립이라 동시에 받음 (OpenDART 응답이 느려 순차 호출 시 종목당 1분 이상 걸림)
+    with ThreadPoolExecutor(len(years)) as ex:
+        by_year = dict(zip(years, (fs[1] for fs in ex.map(lambda y: dart.full_statements(cc, y, rc), years))))
     df = fin.build_table(by_year, years)
     if df.empty:
         r.fail("1", "재무제표 없음")
@@ -55,6 +58,11 @@ def screen_one(dart: Dart, cfg: dict, code: str, name: str, cc: str, years: list
     sh = shares_by_year(dart, cc, years[-4:], rc)
     rules.check_financials(r, df, cfg, audit, sh)
     shares = sh.get(years[-1]) or listed_shares
+    # 사업보고서 이후 액면분할·병합·무상증자가 있으면 DART 주식수가 옛 기준이라 주당가치가 몇 배로 부풀려짐.
+    # 상장주식수와 30% 넘게 차이 나면 상장주식수(자기주식 포함이라 보수적)를 사용.
+    if listed_shares and listed_shares == listed_shares and not (0.77 < listed_shares / shares < 1.3):
+        r.notes.append(f"주식수 기준 변경 감지(DART {shares:,.0f}주 → 상장 {listed_shares:,.0f}주, 분할·병합 추정)로 상장주식수 사용")
+        shares = listed_shares
     if r.passed or True:  # 탈락 종목도 적정가는 계산해 참고용으로 남김
         try:
             rules.valuate(r, df, cfg, price, shares)
@@ -83,7 +91,8 @@ def main(argv=None):
     years = list(range(last - cfg["data"]["years"] + 1, last + 1))
     rc = cfg["data"]["reprt_code"]
 
-    dart = Dart(key, cache)
+    workers = int(cfg["data"].get("workers", 8))
+    dart = Dart(key, cache, workers=workers)
     corp = dart.corp_codes()
     lst = market.listing(cache)
     lst = lst[lst["Market"].isin(cfg["universe"]["markets"])]
@@ -117,24 +126,33 @@ def main(argv=None):
 
     results: list[rules.Result] = []
     liq = cfg["rule4_liquidity"]
-    for _, row in cand.iterrows():
+
+    def process(row) -> rules.Result | None:
         code, name = row["Code"], row["Name"]
         cc = corp[code]["corp_code"]
         try:
             induty = dart.company(cc).get("induty_code")
             if u["exclude_financials"] and rules.is_financial(induty) and code not in hold_codes:
-                continue
+                return None
             avg_val, close = market.avg_trading_value(code, liq["lookback_days"])
             price = close if close == close else float(row["Close"])
             r = screen_one(dart, cfg, code, name, cc, years, price, float(row["Stocks"]), induty)
             r.metrics["avg_trading_value"] = avg_val
             if avg_val < liq["min_avg_trading_value"]:
                 r.fail("4", f"일평균 거래대금 {avg_val / 1e8:.1f}억 원")
-            results.append(r)
+            return r
         except DartError:
             raise
         except Exception as e:  # 한 종목 오류로 전체가 멈추지 않게
-            rr = rules.Result(code=code, name=name); rr.fail("-", f"처리 오류: {e}"); results.append(rr)
+            rr = rules.Result(code=code, name=name); rr.fail("-", f"처리 오류: {e}"); return rr
+
+    rows_ = [row for _, row in cand.iterrows()]
+    with ThreadPoolExecutor(workers) as ex:
+        for i, r in enumerate(ex.map(process, rows_), 1):
+            if r is not None:
+                results.append(r)
+            if i % 50 == 0:
+                print(f"[B] {i}/{len(rows_)} 종목 점검 (DART 호출 {dart.calls}건)", file=sys.stderr, flush=True)
 
     write_report(results, holdings, outdir, today, a.top, cfg)
     print(f"DART 호출 {dart.calls}건", file=sys.stderr)
@@ -189,6 +207,32 @@ def write_report(results, holdings, outdir: Path, today, top: int, cfg: dict):
                      "오너어닝플러스비율": m.get("oe_positive_ratio"), "지배지분율": m.get("owner_share"),
                      "일평균거래대금": m.get("avg_trading_value")})
     pd.DataFrame(rows).to_excel(outdir / f"screen_{today:%Y%m%d}.xlsx", index=False)
+
+    # 대시보드용 JSON (추천 종목·보유종목 계획)
+    def num(x):
+        return None if x is None or x != x else float(x)
+
+    picks = [{"rank": i, "code": r.code, "name": r.name, "tags": " / ".join(r.tags),
+              "price": num(r.metrics.get("price")), "buy_line": num(r.metrics.get("buy_line")),
+              "sell1": num(r.metrics.get("sell1")), "sell2": num(r.metrics.get("sell2")),
+              "upside_to_sell1": num(r.metrics.get("upside_to_sell1")),
+              "buyable": bool(r.metrics.get("buyable")),
+              "avg_trading_value": num(r.metrics.get("avg_trading_value")),
+              "reason": " · ".join(r.notes), "checks": " / ".join(r.checks), "flags": " / ".join(r.flags)}
+             for i, r in enumerate(pick, 1)]
+    plans = []
+    for h in holdings:
+        r = by_code.get(h["code"].zfill(6))
+        if r and r.metrics.get("price"):
+            p = portfolio.plan(h, r.metrics["price"], {"fails": r.fails, "metrics": r.metrics})
+            p["orders"] = [{"price": a, "qty": b, "why": c} for a, b, c in p["orders"]]
+            p["fails"] = r.fails
+            plans.append(p)
+    summary = {"date": f"{today:%Y-%m-%d}", "screened": len(results), "passed": len(passed),
+               "buyable": sum(1 for r in passed if r.metrics["buyable"])}
+    (outdir / f"dashboard_{today:%Y%m%d}.json").write_text(
+        json.dumps({"summary": summary, "picks": picks, "holdings": plans}, ensure_ascii=False, indent=1, default=str),
+        encoding="utf-8")
     print(md)
 
 

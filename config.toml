@@ -8,6 +8,7 @@ cache_dir = "cache"
 output_dir = "output"
 years = 10                 # 기본 확보 연수
 reprt_code = "11011"       # 사업보고서(연간)
+workers = 8                # 동시에 처리할 종목 수 (OpenDART 응답이 느려 병렬로 받음, 종목당 연도별 호출도 동시 진행)
 
 [universe]
 exclude_financials = true  # 은행·보험·증권·지주 등 금융업 제외 (부채비율·영업이익 구조가 달라 규칙 적용이 왜곡됨)
